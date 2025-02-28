@@ -310,6 +310,9 @@ body {
   cursor: pointer;
   transition: var(--transition);
   font-size: 0.95rem;
+  display: flex;
+  align-items: center;
+  position: relative;
 }
 
 #users-list li:hover {
@@ -329,6 +332,22 @@ body {
 #users-list li.everyone {
   background-color: var(--primary-color);
   color: white;
+}
+
+/* Message activity indicator */
+.activity-indicator {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  background-color: var(--success-color);
+  border-radius: 50%;
+  margin-right: 8px;
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+
+.has-activity .activity-indicator {
+  opacity: 1;
 }
 
 @media (min-width: 768px) {
@@ -549,6 +568,8 @@ fs.writeFileSync(
   let currentUsername = null;
   let selectedRecipient = 'everyone';
   let onlineUsers = [];
+  // Store user activity status to track new messages
+  let userActivity = {};
   
   const conversations = {
     'everyone': []
@@ -603,6 +624,11 @@ fs.writeFileSync(
         // Handle chat history from server
         handleChatHistory(message.history);
       } else {
+        if (message.type === 'message' && message.sender !== currentUsername) {
+          // Mark the sender as having new activity
+          updateUserActivity(message.sender);
+        }
+        
         storeMessage(message);
         refreshMessages();
       }
@@ -629,10 +655,41 @@ fs.writeFileSync(
     });
   }
   
+  function updateUserActivity(username) {
+    if (username !== 'everyone' && username !== currentUsername) {
+      userActivity[username] = true;
+      updateUserActivityIndicators();
+    }
+  }
+  
+  function clearUserActivity(username) {
+    if (userActivity[username]) {
+      userActivity[username] = false;
+      updateUserActivityIndicators();
+    }
+  }
+  
+  function updateUserActivityIndicators() {
+    document.querySelectorAll('#users-list li').forEach(item => {
+      const userId = item.dataset.userId;
+      if (userId !== 'everyone' && userId !== currentUsername) {
+        if (userActivity[userId]) {
+          item.classList.add('has-activity');
+        } else {
+          item.classList.remove('has-activity');
+        }
+      }
+    });
+  }
+  
   function handleChatHistory(history) {
     // Clear conversations to reload with server data
     for (const key in conversations) {
-      conversations[key] = [];
+      if (key !== 'everyone') {
+        delete conversations[key];
+      } else {
+        conversations[key] = [];
+      }
     }
     
     // Process and store all messages from history
@@ -669,15 +726,28 @@ fs.writeFileSync(
     
     users.forEach(user => {
       const userItem = document.createElement('li');
-      userItem.textContent = user.username;
+      
+      // Add activity indicator
+      const activityIndicator = document.createElement('span');
+      activityIndicator.className = 'activity-indicator';
+      userItem.appendChild(activityIndicator);
+      
+      const userNameSpan = document.createElement('span');
+      userNameSpan.textContent = user.username;
+      userItem.appendChild(userNameSpan);
       
       if (user.id === currentUsername) {
         userItem.classList.add('current-user');
-        userItem.textContent += ' (You)';
+        userNameSpan.textContent += ' (You)';
       }
       
       if (user.id === selectedRecipient) {
         userItem.classList.add('selected');
+      }
+      
+      // Apply activity status if applicable
+      if (userActivity[user.id]) {
+        userItem.classList.add('has-activity');
       }
       
       if (!conversations[user.id]) {
@@ -693,6 +763,11 @@ fs.writeFileSync(
         document.querySelectorAll('#users-list li').forEach(li => li.classList.remove('selected'));
         this.classList.add('selected');
         selectedRecipient = this.dataset.userId;
+        
+        // Clear activity indicator when selecting a user
+        if (selectedRecipient !== 'everyone') {
+          clearUserActivity(selectedRecipient);
+        }
         
         if (selectedRecipient === 'everyone') {
           recipientLabel.textContent = 'To: Everyone';
@@ -839,12 +914,31 @@ const clients = new Map();
 // Store messages persistently in memory
 const messageHistory = {
   public: [], // Store all public messages
-  private: {} // Store private messages by user pairs
+  private: {}, // Store private messages by user pairs
+  privateMappings: {} // Map usernames to their private conversation pairs
 };
 
 // Helper function to get a key for private messages between two users
 function getPrivateKey(user1, user2) {
   return [user1, user2].sort().join(':');
+}
+
+// Helper function to update the username mappings for private conversations
+function updatePrivateMappings(username) {
+  if (!messageHistory.privateMappings[username]) {
+    messageHistory.privateMappings[username] = [];
+  }
+  
+  // Find all private conversations involving this user
+  Object.keys(messageHistory.private).forEach(key => {
+    const users = key.split(':');
+    if (users.includes(username)) {
+      const otherUser = users.find(u => u !== username);
+      if (otherUser && !messageHistory.privateMappings[username].includes(otherUser)) {
+        messageHistory.privateMappings[username].push(otherUser);
+      }
+    }
+  });
 }
 
 wss.on('connection', (ws) => {
@@ -881,6 +975,9 @@ wss.on('connection', (ws) => {
         clientInfo.id = username;
         clients.set(ws, clientInfo);
         
+        // Update private message mappings for this user
+        updatePrivateMappings(username);
+        
         // Send welcome message
         const welcomeMessage = {
           type: 'system',
@@ -899,43 +996,76 @@ wss.on('connection', (ws) => {
         };
         messageHistory.public.push(joinMessage);
         
-        // Broadcast join message to all other clients
-        broadcastMessage(joinMessage, ws);
+        // Broadcast to all clients that a new user joined
+        broadcastMessage(joinMessage);
+        broadcastUserList();
         
-        // Send chat history to the user
-        sendChatHistoryToUser(ws, username);
+        // Send chat history to the new user
+        sendChatHistory(ws);
+      } else if (parsedMessage.type === 'message') {
+        const sender = clientInfo.username;
+        const now = new Date().toISOString();
         
-        // Update user list for everyone
-        sendUserList();
-        
-        return;
-      }
-      
-      if (parsedMessage.type === 'message' || !parsedMessage.type) {
         if (parsedMessage.recipient) {
-          sendPrivateMessage(clientInfo.id, parsedMessage.recipient, parsedMessage.content);
-        } else {
-          const messageToSend = {
+          // This is a private message
+          let recipientWs = null;
+          for (const [clientWs, client] of clients.entries()) {
+            if (client.id === parsedMessage.recipient) {
+              recipientWs = clientWs;
+              break;
+            }
+          }
+          
+          const privateMessage = {
             type: 'message',
             content: parsedMessage.content,
-            sender: clientInfo.id,
-            timestamp: new Date().toISOString()
+            sender: sender,
+            recipient: parsedMessage.recipient,
+            isPrivate: true,
+            timestamp: now
           };
           
-          // Store message in history
-          messageHistory.public.push(messageToSend);
+          // Store private message in history
+          const privateKey = getPrivateKey(sender, parsedMessage.recipient);
+          if (!messageHistory.private[privateKey]) {
+            messageHistory.private[privateKey] = [];
+          }
+          messageHistory.private[privateKey].push(privateMessage);
+          
+          // Update private mappings for both users
+          updatePrivateMappings(sender);
+          updatePrivateMappings(parsedMessage.recipient);
+          
+          // Send to recipient and sender
+          if (recipientWs && recipientWs.readyState === WebSocket.OPEN) {
+            recipientWs.send(JSON.stringify(privateMessage));
+          }
+          ws.send(JSON.stringify(privateMessage));
+        } else {
+          // This is a public message
+          const publicMessage = {
+            type: 'message',
+            content: parsedMessage.content,
+            sender: sender,
+            isPrivate: false,
+            timestamp: now
+          };
+          
+          // Store in public message history
+          messageHistory.public.push(publicMessage);
           
           // Broadcast to all clients
-          broadcastMessage(messageToSend);
+          broadcastMessage(publicMessage);
         }
       }
-    } catch (e) {
-      console.error('Error parsing message:', e);
+    } catch (error) {
+      console.error('Error processing message:', error);
     }
   });
   
   ws.on('close', () => {
-    const username = clients.get(ws)?.username || tempId;
+    const username = clientInfo.username;
+    clients.delete(ws);
     
     const leaveMessage = {
       type: 'system',
@@ -944,146 +1074,73 @@ wss.on('connection', (ws) => {
       timestamp: new Date().toISOString()
     };
     
-    // Store leave message
     messageHistory.public.push(leaveMessage);
-    
-    // Broadcast leave message
     broadcastMessage(leaveMessage);
-    
-    clients.delete(ws);
-    
-    sendUserList();
+    broadcastUserList();
   });
+
+  // Send initial user list to the client
+  broadcastUserList();
 });
 
-function sendChatHistoryToUser(ws, username) {
-  // Prepare history object to send to the client
-  const userHistory = {
-    publicMessages: messageHistory.public,
-    privateMessages: {}
-  };
+// Function to send chat history to a new user
+function sendChatHistory(ws) {
+  const client = clients.get(ws);
+  if (!client) return;
   
-  // Add private messages where this user is involved
-  Object.keys(messageHistory.private).forEach(key => {
-    if (key.includes(username)) {
-      const otherUser = key.split(':').find(u => u !== username);
-      if (otherUser) {
-        userHistory.privateMessages[otherUser] = messageHistory.private[key];
-      }
+  const username = client.username;
+  
+  // Prepare public messages
+  const publicMessages = [...messageHistory.public];
+  
+  // Prepare private messages for this user
+  const privateMessages = {};
+  const userMappings = messageHistory.privateMappings[username] || [];
+  
+  userMappings.forEach(otherUser => {
+    privateMessages[otherUser] = [];
+    const privateKey = getPrivateKey(username, otherUser);
+    
+    if (messageHistory.private[privateKey]) {
+      privateMessages[otherUser] = messageHistory.private[privateKey];
     }
   });
   
-  // Send history to user
+  // Send history to client
   ws.send(JSON.stringify({
     type: 'chatHistory',
-    history: userHistory
+    history: {
+      publicMessages,
+      privateMessages
+    }
   }));
 }
 
-function sendPrivateMessage(senderId, recipientId, content) {
-  const timestamp = new Date().toISOString();
-  const messageObject = {
-    type: 'message',
-    content: content,
-    sender: senderId,
-    recipient: recipientId,
-    isPrivate: true,
-    timestamp: timestamp
-  };
-  
-  // Store private message in history
-  const privateKey = getPrivateKey(senderId, recipientId);
-  if (!messageHistory.private[privateKey]) {
-    messageHistory.private[privateKey] = [];
-  }
-  messageHistory.private[privateKey].push(messageObject);
-  
-  let recipientFound = false;
-  clients.forEach(({id, ws}) => {
-    if (id === recipientId) {
-      ws.send(JSON.stringify(messageObject));
-      recipientFound = true;
-    }
-    
-    if (id === senderId) {
-      ws.send(JSON.stringify(messageObject));
-    }
-  });
-  
-  if (!recipientFound) {
-    const senderWs = findClientWsByUserId(senderId);
-    if (senderWs) {
-      const notificationMessage = {
-        type: 'system',
-        content: `User ${recipientId} is not available. Message has been saved and will be delivered when they reconnect.`,
-        sender: 'System',
-        timestamp: new Date().toISOString()
-      };
-      
-      senderWs.send(JSON.stringify(notificationMessage));
-    }
-  }
-}
-
-function findClientWsByUserId(userId) {
-  for (const [ws, clientInfo] of clients.entries()) {
-    if (clientInfo.id === userId) {
-      return ws;
-    }
-  }
-  return null;
-}
-
-function sendUserList() {
+// Function to broadcast user list to all clients
+function broadcastUserList() {
   const userList = Array.from(clients.values()).map(client => ({
     id: client.id,
     username: client.username
   }));
   
-  const userListMessage = {
-    type: 'userList',
-    users: userList
-  };
-  
-  clients.forEach(({ws}) => {
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(JSON.stringify(userListMessage));
-    }
-  });
+  for (const [client, _] of clients.entries()) {
+    client.send(JSON.stringify({
+      type: 'userList',
+      users: userList
+    }));
+  }
 }
 
-function broadcastMessage(message, excludeClient = null) {
-  const messageStr = JSON.stringify(message);
-  clients.forEach(({ws}) => {
-    if (ws !== excludeClient && ws.readyState === WebSocket.OPEN) {
-      ws.send(messageStr);
-    }
-  });
+// Function to broadcast message to all clients
+function broadcastMessage(message) {
+  for (const [client, _] of clients.entries()) {
+    client.send(JSON.stringify(message));
+  }
 }
 
-// Create package.json if it doesn't exist
-const packageJsonPath = path.join(__dirname, 'package.json');
-if (!fs.existsSync(packageJsonPath)) {
-  fs.writeFileSync(packageJsonPath, JSON.stringify({
-    "name": "websocket-chat",
-    "version": "1.0.0",
-    "description": "WebSocket chat application with custom usernames and private messaging",
-    "main": "server.js",
-    "scripts": {
-      "start": "node server.js"
-    },
-    "engines": {
-      "node": ">=14"
-    },
-    "dependencies": {
-      "express": "^4.18.2",
-      "ws": "^8.16.0"
-    }
-  }, null, 2));
-}
-
-// Use the PORT environment variable that Render will provide
+// Start the server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`Server started on port ${PORT}`);
+  console.log(`Server is running on port ${PORT}`);
+  console.log(`Visit http://localhost:${PORT} to access the chat`);
 });
