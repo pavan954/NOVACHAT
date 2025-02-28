@@ -431,6 +431,9 @@ fs.writeFileSync(
       
       if (message.type === 'userList') {
         updateUsersList(message.users);
+      } else if (message.type === 'chatHistory') {
+        // Handle chat history from server
+        handleChatHistory(message.history);
       } else {
         storeMessage(message);
         refreshMessages();
@@ -456,6 +459,34 @@ fs.writeFileSync(
       connectionStatus.textContent = 'Connection Error';
       connectionStatus.className = 'status disconnected';
     });
+  }
+  
+  function handleChatHistory(history) {
+    // Clear conversations to reload with server data
+    for (const key in conversations) {
+      conversations[key] = [];
+    }
+    
+    // Process and store all messages from history
+    if (history.publicMessages) {
+      history.publicMessages.forEach(msg => {
+        conversations['everyone'].push(msg);
+      });
+    }
+    
+    if (history.privateMessages) {
+      Object.keys(history.privateMessages).forEach(userId => {
+        if (!conversations[userId]) {
+          conversations[userId] = [];
+        }
+        
+        history.privateMessages[userId].forEach(msg => {
+          conversations[userId].push(msg);
+        });
+      });
+    }
+    
+    refreshMessages();
   }
   
   function updateUsersList(users) {
@@ -637,6 +668,17 @@ const wss = new WebSocket.Server({ server });
 
 const clients = new Map();
 
+// Store messages persistently in memory
+const messageHistory = {
+  public: [], // Store all public messages
+  private: {} // Store private messages by user pairs
+};
+
+// Helper function to get a key for private messages between two users
+function getPrivateKey(user1, user2) {
+  return [user1, user2].sort().join(':');
+}
+
 wss.on('connection', (ws) => {
   const tempId = `user_${Math.floor(Math.random() * 10000)}`;
   let clientInfo = { id: tempId, username: tempId, ws };
@@ -671,20 +713,31 @@ wss.on('connection', (ws) => {
         clientInfo.id = username;
         clients.set(ws, clientInfo);
         
-        ws.send(JSON.stringify({
+        // Send welcome message
+        const welcomeMessage = {
           type: 'system',
           content: `Welcome to the chat, ${username}!`,
           sender: 'System',
           timestamp: new Date().toISOString()
-        }));
+        };
+        ws.send(JSON.stringify(welcomeMessage));
         
-        broadcastMessage({
+        // Store join message in history
+        const joinMessage = {
           type: 'system',
           content: `${username} has joined the chat`,
           sender: 'System',
           timestamp: new Date().toISOString()
-        }, ws);
+        };
+        messageHistory.public.push(joinMessage);
         
+        // Broadcast join message to all other clients
+        broadcastMessage(joinMessage, ws);
+        
+        // Send chat history to the user
+        sendChatHistoryToUser(ws, username);
+        
+        // Update user list for everyone
         sendUserList();
         
         return;
@@ -701,6 +754,10 @@ wss.on('connection', (ws) => {
             timestamp: new Date().toISOString()
           };
           
+          // Store message in history
+          messageHistory.public.push(messageToSend);
+          
+          // Broadcast to all clients
           broadcastMessage(messageToSend);
         }
       }
@@ -712,18 +769,48 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const username = clients.get(ws)?.username || tempId;
     
-    broadcastMessage({
+    const leaveMessage = {
       type: 'system',
       content: `${username} has left the chat`,
       sender: 'System',
       timestamp: new Date().toISOString()
-    });
+    };
+    
+    // Store leave message
+    messageHistory.public.push(leaveMessage);
+    
+    // Broadcast leave message
+    broadcastMessage(leaveMessage);
     
     clients.delete(ws);
     
     sendUserList();
   });
 });
+
+function sendChatHistoryToUser(ws, username) {
+  // Prepare history object to send to the client
+  const userHistory = {
+    publicMessages: messageHistory.public,
+    privateMessages: {}
+  };
+  
+  // Add private messages where this user is involved
+  Object.keys(messageHistory.private).forEach(key => {
+    if (key.includes(username)) {
+      const otherUser = key.split(':').find(u => u !== username);
+      if (otherUser) {
+        userHistory.privateMessages[otherUser] = messageHistory.private[key];
+      }
+    }
+  });
+  
+  // Send history to user
+  ws.send(JSON.stringify({
+    type: 'chatHistory',
+    history: userHistory
+  }));
+}
 
 function sendPrivateMessage(senderId, recipientId, content) {
   const timestamp = new Date().toISOString();
@@ -735,6 +822,13 @@ function sendPrivateMessage(senderId, recipientId, content) {
     isPrivate: true,
     timestamp: timestamp
   };
+  
+  // Store private message in history
+  const privateKey = getPrivateKey(senderId, recipientId);
+  if (!messageHistory.private[privateKey]) {
+    messageHistory.private[privateKey] = [];
+  }
+  messageHistory.private[privateKey].push(messageObject);
   
   let recipientFound = false;
   clients.forEach(({id, ws}) => {
@@ -751,12 +845,14 @@ function sendPrivateMessage(senderId, recipientId, content) {
   if (!recipientFound) {
     const senderWs = findClientWsByUserId(senderId);
     if (senderWs) {
-      senderWs.send(JSON.stringify({
+      const notificationMessage = {
         type: 'system',
-        content: `User ${recipientId} is not available. Message could not be delivered.`,
+        content: `User ${recipientId} is not available. Message has been saved and will be delivered when they reconnect.`,
         sender: 'System',
         timestamp: new Date().toISOString()
-      }));
+      };
+      
+      senderWs.send(JSON.stringify(notificationMessage));
     }
   }
 }
